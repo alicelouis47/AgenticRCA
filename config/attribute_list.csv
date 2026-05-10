@@ -1,0 +1,9 @@
+Time Series,PROCESS_LEVEL,PROCESS_NAME,COMPONENT_NAME,Source Attribute(ODS),Formula,Attribute_Name,Description,Alias,X-variable,Data by,param/attribute,Initial analysis,failure mode
+Daily,L1,HDD Write,Head,write_error_rate,,WriteErrRate,Write error rate per head,WER,Yes,Event,attribute,zscore,Write failure
+Daily,L1,HDD Read,Head,read_error_rate,,ReadErrRate,Read error rate per head,RER,Yes,Event,attribute,zscore,Read failure
+Daily,L2,Servo,Head,seek_error_rate,,SeekErrRate,Seek error rate,SER,Yes,Event,attribute,iqr,Seek failure
+Daily,L1,HDD Write,Drive,reallocated_sector_count,,ReallocSect,Reallocated sector count,RSC,No,Attr,param,changepoint,Wear
+Daily,L2,Thermal,Drive,temperature_celsius,,Temp,Drive temperature in Celsius,TEMP,No,SMART,param,zscore,Thermal failure
+Daily,L1,HDD Read,Head,head_flying_hours,,FlyHrs,Head flying hours,FH,No,Event,attribute,zscore,Mechanical wear
+Daily,L3,Servo,Head,head_amplitude,,HeadAmp,Head amplitude,AMP,Yes,Event,attribute,iqr,Servo error
+Daily,L1,HDD Write,Drive,pending_sector_count,,PendingSect,Pending sector count,PSC,No,Attr,param,zscore,Data integrity

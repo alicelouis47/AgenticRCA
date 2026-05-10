@@ -2,11 +2,13 @@ from __future__ import annotations
 import json
 import pandas as pd
 from openai import OpenAI
-from config import OPENAI_API_KEY, OPENAI_MODEL, PROMPTS_DIR
+from config import OPENAI_API_KEY, OPENAI_MODEL, PROMPTS_DIR, CONFIG_DIR
 from agent.skill_loader import load_all_skills
 from tools.trino_client import TrinoClient
 from tools.rca_engine import RCAEngine
 from tools.plotter import Plotter
+from tools.attr_mapper import AttributeMapper
+from tools.sql_builder import SQLBuilder
 
 
 TOOLS = [
@@ -73,6 +75,55 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "map_and_fetch_data",
+            "description": (
+                "Map attribute names from attribute_list.csv to actual DB columns using "
+                "fuzzy matching, build a 3-table LEFT JOIN SQL query, and fetch data from Trino. "
+                "Use this when the user wants to pull Drive HDD data based on an attribute requirements list."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "threshold": {
+                        "type": "number",
+                        "description": "Fuzzy match score threshold (0–100). Attributes scoring below this are flagged as unmatched. Default: 80.",
+                        "default": 80,
+                    },
+                    "time_filter": {
+                        "type": "string",
+                        "description": "Optional SQL WHERE clause for date filtering, e.g. \"e.event_date_key_st >= DATE '2024-01-01'\". Omit for no filter.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max rows to return. Default 1000.",
+                        "default": 1000,
+                    },
+                    "select_all_event": {
+                        "type": "boolean",
+                        "description": "If true, selects e.* (all event columns) instead of only matched ones. Default false.",
+                        "default": False,
+                    },
+                    "override_mapping": {
+                        "type": "array",
+                        "description": "List of manual overrides for unmatched attributes.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "orig_index": {"type": "integer", "description": "Row index from attribute_list.csv (0-based)."},
+                                "column_name": {"type": "string", "description": "Exact column name in DB."},
+                                "table_name": {"type": "string", "description": "Exact table name."},
+                            },
+                            "required": ["orig_index", "column_name", "table_name"],
+                        },
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -85,6 +136,9 @@ class AgentOrchestrator:
         self._data: pd.DataFrame | None = None
         self._rca_report: dict | None = None
         self._figure = None
+        self._mapping: pd.DataFrame | None = None
+        self._attr_csv = CONFIG_DIR / "attribute_list.csv"
+        self._schema_csv = CONFIG_DIR / "drive_hd.csv"
 
     # ── System prompt ──────────────────────────────────────────────────────────
 
@@ -152,7 +206,105 @@ class AgentOrchestrator:
             except Exception as e:
                 return f"❌ Plot error: {e}", None
 
+        if name == "map_and_fetch_data":
+            return self._exec_map_and_fetch(args)
+
         return f"❌ Unknown tool: {name}", None
+
+    def _exec_map_and_fetch(self, args: dict) -> tuple[str, None]:
+        """Fuzzy-map attributes → columns → build SQL → execute via Trino."""
+        threshold = float(args.get("threshold", 80))
+        time_filter = args.get("time_filter") or None
+        limit = int(args.get("limit", 1000))
+        select_all_event = bool(args.get("select_all_event", False))
+        overrides = args.get("override_mapping") or []
+
+        # ── Step 1: Fuzzy map ────────────────────────────────────────────────
+        try:
+            mapper = AttributeMapper(
+                attr_csv=self._attr_csv,
+                schema_csv=self._schema_csv,
+                threshold=threshold,
+            )
+            mapper.run()
+        except FileNotFoundError as e:
+            return (
+                f"❌ CSV file missing: {e}\n"
+                "Please place `attribute_list.csv` and `drive_hd.csv` in the `config/` folder.",
+                None,
+            )
+        except Exception as e:
+            return f"❌ Mapping error: {e}", None
+
+        # Apply manual overrides
+        for ov in overrides:
+            mapper.override(
+                orig_index=int(ov["orig_index"]),
+                column_name=str(ov["column_name"]),
+                table_name=str(ov["table_name"]),
+            )
+
+        summary = mapper.summary()
+        matched_df = mapper.matched()
+        unmatched_df = mapper.unmatched()
+        self._mapping = mapper._mapping
+
+        # ── Step 2: Report unmatched ─────────────────────────────────────────
+        unmatched_report = ""
+        if not unmatched_df.empty:
+            items = []
+            for _, r in unmatched_df.iterrows():
+                items.append(
+                    f"  • [{r['orig_index']}] source='{r['source_attr']}' / attr='{r['attribute_name']}' "
+                    f"(best score: {r['match_score']:.0f})"
+                )
+            unmatched_report = (
+                "\n⚠️ Unmatched attributes (score < threshold):\n"
+                + "\n".join(items)
+                + "\nYou can call `map_and_fetch_data` again with `override_mapping` to fix these."
+            )
+
+        if matched_df.empty:
+            return (
+                f"{summary}{unmatched_report}\n"
+                "❌ No attributes matched — cannot build SQL. Adjust threshold or fix attribute names.",
+                None,
+            )
+
+        # ── Step 3: Build SQL ────────────────────────────────────────────────
+        try:
+            builder = SQLBuilder(
+                mapping_df=matched_df,
+                time_filter=time_filter,
+                limit=limit,
+                select_all_event=select_all_event,
+            )
+            sql, col_map = builder.build()
+            col_map_md = SQLBuilder.format_col_map(col_map)
+        except Exception as e:
+            return f"❌ SQL build error: {e}", None
+
+        # ── Step 4: Execute ──────────────────────────────────────────────────
+        try:
+            df = self.trino.execute_query(sql, limit=limit)
+            self._data = df
+            fetch_result = (
+                f"✅ Fetched {len(df)} rows × {len(df.columns)} columns.\n"
+                f"Columns: {', '.join(df.columns)}\n\nPreview:\n{df.head(5).to_string(index=False)}"
+            )
+        except Exception as e:
+            fetch_result = (
+                f"⚠️ Trino query failed: {e}\n"
+                f"Generated SQL (for manual execution):\n```sql\n{sql}\n```"
+            )
+
+        result_text = (
+            f"{summary}{unmatched_report}\n"
+            f"\n📋 Column Mapping:\n{col_map_md}\n"
+            f"\n🔍 Generated SQL:\n```sql\n{sql}\n```\n"
+            f"\n{fetch_result}"
+        )
+        return result_text, None
 
     # ── Main run ───────────────────────────────────────────────────────────────
 
@@ -200,3 +352,4 @@ class AgentOrchestrator:
         self._data = None
         self._rca_report = None
         self._figure = None
+        self._mapping = None

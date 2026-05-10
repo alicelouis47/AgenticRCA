@@ -14,6 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from agent.orchestrator import AgentOrchestrator
 from agent.skill_loader import load_all_skills, save_skill, delete_skill
 from tools.trino_client import TrinoClient
+from tools.attr_mapper import AttributeMapper
+from tools.sql_builder import SQLBuilder
+from config import CONFIG_DIR
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -121,6 +124,10 @@ if "figures" not in st.session_state:
     st.session_state.figures = []
 if "skill_edit" not in st.session_state:
     st.session_state.skill_edit = None
+if "mapping_df" not in st.session_state:
+    st.session_state.mapping_df = None
+if "generated_sql" not in st.session_state:
+    st.session_state.generated_sql = None
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -136,7 +143,7 @@ with st.sidebar:
     )
     st.divider()
 
-    pages = ["💬 Chat", "🧩 Skills Manager", "🔌 Trino Config"]
+    pages = ["💬 Chat", "🗂️ Attribute Mapper", "🧩 Skills Manager", "🔌 Trino Config"]
     for pg in pages:
         active = "active" if st.session_state.page == pg else ""
         if st.button(pg, key=f"nav_{pg}", use_container_width=True):
@@ -280,7 +287,250 @@ def page_chat():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE 2 — SKILLS MANAGER
+# PAGE 2 — ATTRIBUTE MAPPER
+# ══════════════════════════════════════════════════════════════════════════════
+def page_attr_mapper():
+    st.markdown('<div class="section-hdr">🗂️ Attribute Mapper</div>', unsafe_allow_html=True)
+    st.caption(
+        "Fuzzy-match attribute names from `attribute_list.csv` to actual DB columns in `drive_hd.csv`, "
+        "then generate the 3-table LEFT JOIN SQL query."
+    )
+
+    col_cfg, col_result = st.columns([1, 2])
+
+    # ── Left panel: configuration ─────────────────────────────────────────────
+    with col_cfg:
+        st.subheader("⚙️ Configuration")
+
+        threshold = st.slider(
+            "Fuzzy Match Threshold",
+            min_value=0, max_value=100, value=80, step=5,
+            help="Attributes with score < threshold will be flagged as Unmatched.",
+            key="mapper_threshold",
+        )
+
+        time_filter = st.text_input(
+            "Time Filter (SQL WHERE expression, optional)",
+            placeholder="e.g. e.event_date_key_st >= DATE '2024-01-01'",
+            key="mapper_time_filter",
+        )
+
+        limit = st.number_input(
+            "Row Limit", min_value=1, max_value=100000, value=1000, step=100,
+            key="mapper_limit",
+        )
+
+        select_all_event = st.toggle(
+            "SELECT e.* (all event columns)",
+            value=False,
+            key="mapper_select_all",
+            help="When ON: selects all columns from event view. When OFF: only matched columns.",
+        )
+
+        st.divider()
+
+        # Upload CSVs
+        st.subheader("📂 CSV Files")
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            attr_path = CONFIG_DIR / "attribute_list.csv"
+            st.caption("**attribute_list.csv** (requirements)")
+            if attr_path.exists():
+                st.success(f"✅ Found ({attr_path.stat().st_size:,} B)")
+            else:
+                st.error("❌ Not found")
+            up_attr = st.file_uploader("Upload attribute_list.csv", type="csv", key="up_attr")
+            if up_attr:
+                with open(attr_path, "wb") as f:
+                    f.write(up_attr.read())
+                st.success("Saved!")
+                st.rerun()
+
+        with col_b:
+            schema_path = CONFIG_DIR / "drive_hd.csv"
+            st.caption("**drive_hd.csv** (DB schema)")
+            if schema_path.exists():
+                st.success(f"✅ Found ({schema_path.stat().st_size:,} B)")
+            else:
+                st.error("❌ Not found")
+            up_schema = st.file_uploader("Upload drive_hd.csv", type="csv", key="up_schema")
+            if up_schema:
+                with open(schema_path, "wb") as f:
+                    f.write(up_schema.read())
+                st.success("Saved!")
+                st.rerun()
+
+        st.divider()
+        run_map = st.button("🔍 Run Mapping", type="primary", use_container_width=True, key="run_mapping")
+
+    # ── Right panel: results ──────────────────────────────────────────────────
+    with col_result:
+        if run_map:
+            attr_path = CONFIG_DIR / "attribute_list.csv"
+            schema_path = CONFIG_DIR / "drive_hd.csv"
+
+            if not attr_path.exists() or not schema_path.exists():
+                st.error("❌ Please upload both CSV files first.")
+            else:
+                with st.spinner("Running fuzzy match..."):
+                    try:
+                        mapper = AttributeMapper(
+                            attr_csv=attr_path,
+                            schema_csv=schema_path,
+                            threshold=threshold,
+                        )
+                        mapper.run()
+                        st.session_state.mapping_df = mapper._mapping.copy()
+
+                        # Build SQL preview
+                        matched_df = mapper.matched()
+                        if not matched_df.empty:
+                            builder = SQLBuilder(
+                                mapping_df=matched_df,
+                                time_filter=time_filter.strip() if time_filter.strip() else None,
+                                limit=int(limit),
+                                select_all_event=select_all_event,
+                            )
+                            sql, col_map = builder.build()
+                            st.session_state.generated_sql = sql
+                            st.session_state.col_map = col_map
+                        else:
+                            st.session_state.generated_sql = None
+                            st.session_state.col_map = None
+                    except Exception as e:
+                        st.error(f"❌ Error: {e}")
+
+        if st.session_state.mapping_df is not None:
+            mapping_df = st.session_state.mapping_df
+            n_total = len(mapping_df)
+            n_match = (mapping_df["status"] == "matched").sum()
+            n_un = n_total - n_match
+
+            # Summary metrics
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Attributes", n_total)
+            m2.metric("✅ Matched", n_match)
+            m3.metric("❌ Unmatched", n_un)
+
+            st.subheader("📋 Mapping Table")
+
+            def _color_row(row):
+                color = "background-color: #14532d22" if row["status"] == "matched" else "background-color: #7f1d1d22"
+                return [color] * len(row)
+
+            display_cols = [
+                "orig_index", "PROCESS_NAME", "COMPONENT_NAME",
+                "source_attr", "attribute_name",
+                "matched_column", "matched_table", "table_alias",
+                "match_score", "status",
+            ]
+            styled = mapping_df[display_cols].style.apply(_color_row, axis=1)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+
+            # Download mapping
+            csv_data = mapping_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📥 Download Mapping CSV",
+                data=csv_data,
+                file_name="attribute_mapping_result.csv",
+                mime="text/csv",
+            )
+
+            st.divider()
+
+            # Manual override section
+            with st.expander("🔧 Manual Override for Unmatched Attributes", expanded=n_un > 0):
+                unmatched = mapping_df[mapping_df["status"] == "unmatched"]
+                if unmatched.empty:
+                    st.success("All attributes matched! No overrides needed.")
+                else:
+                    st.warning(f"{n_un} attribute(s) need manual mapping.")
+                    schema_df = pd.read_csv(CONFIG_DIR / "drive_hd.csv")
+                    all_cols = schema_df["column_name"].tolist()
+                    all_tables = schema_df["table_name"].unique().tolist()
+
+                    for _, row in unmatched.iterrows():
+                        st.markdown(
+                            f"**[{row['orig_index']}]** `{row['source_attr']}` / `{row['attribute_name']}`  "
+                            f"(best score: {row['match_score']:.0f})"
+                        )
+                        oc1, oc2, oc3 = st.columns([2, 2, 1])
+                        with oc1:
+                            sel_col = st.selectbox(
+                                "Column", ["— skip —"] + all_cols,
+                                key=f"ov_col_{row['orig_index']}"
+                            )
+                        with oc2:
+                            sel_tbl = st.selectbox(
+                                "Table", all_tables,
+                                key=f"ov_tbl_{row['orig_index']}"
+                            )
+                        with oc3:
+                            if st.button("Apply", key=f"ov_btn_{row['orig_index']}"):
+                                if sel_col != "— skip —":
+                                    from tools.attr_mapper import TABLE_ALIASES
+                                    idx = row['orig_index']
+                                    st.session_state.mapping_df.loc[
+                                        st.session_state.mapping_df["orig_index"] == idx,
+                                        ["matched_column", "matched_table", "table_alias",
+                                         "match_score", "matched_by", "status"]
+                                    ] = [sel_col, sel_tbl, TABLE_ALIASES.get(sel_tbl, ""),
+                                         100.0, "manual_override", "matched"]
+                                    st.success(f"Override applied for [{idx}]")
+                                    # Rebuild SQL
+                                    matched_df2 = st.session_state.mapping_df[
+                                        st.session_state.mapping_df["status"] == "matched"
+                                    ]
+                                    b2 = SQLBuilder(
+                                        mapping_df=matched_df2,
+                                        time_filter=time_filter.strip() if time_filter.strip() else None,
+                                        limit=int(limit),
+                                        select_all_event=select_all_event,
+                                    )
+                                    sql2, cm2 = b2.build()
+                                    st.session_state.generated_sql = sql2
+                                    st.session_state.col_map = cm2
+                                    st.rerun()
+
+            # SQL Preview
+            if st.session_state.generated_sql:
+                st.subheader("🔍 Generated SQL")
+                st.code(st.session_state.generated_sql, language="sql")
+
+                # Column mapping table
+                if st.session_state.get("col_map") is not None:
+                    with st.expander("📊 Column Mapping Detail", expanded=False):
+                        st.dataframe(st.session_state.col_map, use_container_width=True, hide_index=True)
+
+                # Execute button
+                st.divider()
+                if st.button("▶️ Execute Query via Trino", type="primary", use_container_width=True, key="exec_sql"):
+                    with st.spinner("Executing..."):
+                        try:
+                            client = TrinoClient()
+                            df = client.execute_query(st.session_state.generated_sql, limit=int(limit))
+                            st.session_state.agent._data = df
+                            st.success(f"✅ Fetched {len(df):,} rows × {len(df.columns)} columns")
+                            st.dataframe(df.head(20), use_container_width=True)
+                        except Exception as e:
+                            st.error(f"❌ Trino error: {e}")
+        else:
+            st.info("👈 Configure options on the left and click **Run Mapping** to start.")
+
+            # Show current CSV previews if available
+            attr_path = CONFIG_DIR / "attribute_list.csv"
+            schema_path = CONFIG_DIR / "drive_hd.csv"
+            if attr_path.exists():
+                with st.expander("👁️ Preview attribute_list.csv", expanded=True):
+                    st.dataframe(pd.read_csv(attr_path), use_container_width=True)
+            if schema_path.exists():
+                with st.expander("👁️ Preview drive_hd.csv (schema)", expanded=False):
+                    st.dataframe(pd.read_csv(schema_path), use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 — SKILLS MANAGER
 # ══════════════════════════════════════════════════════════════════════════════
 def page_skills():
     st.markdown('<div class="section-hdr">🧩 Skills Manager</div>', unsafe_allow_html=True)
@@ -452,6 +702,8 @@ def page_trino():
 page = st.session_state.page
 if page == "💬 Chat":
     page_chat()
+elif page == "🗂️ Attribute Mapper":
+    page_attr_mapper()
 elif page == "🧩 Skills Manager":
     page_skills()
 elif page == "🔌 Trino Config":
