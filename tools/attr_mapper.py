@@ -106,8 +106,32 @@ class AttributeMapper:
 
     # ── Matching ──────────────────────────────────────────────────────────────
 
-    def _best_match(self, candidates: list[str]) -> dict:
-        """Find the highest-scoring column across all candidates."""
+    def _best_match(self, candidates: list[str], source_attr: str = "") -> dict:
+        """
+        Find the highest-scoring column across all candidates.
+
+        Priority strategy
+        -----------------
+        1. Exact match on `source_attr` (Source Attribute(ODS)) — score 100, wins immediately.
+        2. Fuzzy match across all candidates — picks highest token-sort-ratio score.
+        """
+        # ── 1. Exact match on Source Attribute(ODS) first ───────────────────────
+        if source_attr and not pd.isna(source_attr):
+            src = source_attr.strip().lower()
+            exact_rows = self.schema_df[
+                self.schema_df["column_name"].str.strip().str.lower() == src
+            ]
+            if not exact_rows.empty:
+                row = exact_rows.iloc[0]  # take first exact hit
+                return {
+                    "score": 100.0,
+                    "column_name": str(row["column_name"]),
+                    "table_name": str(row["table_name"]),
+                    "data_type": row.get("data_type", ""),
+                    "matched_by": source_attr,
+                }
+
+        # ── 2. Fuzzy match fallback ──────────────────────────────────────────────
         best = {"score": -1.0, "column_name": None, "table_name": None,
                 "data_type": None, "matched_by": None}
 
@@ -152,7 +176,8 @@ class AttributeMapper:
                 )
                 continue
 
-            best = self._best_match(candidates)
+            source_attr = str(row.get("Source Attribute(ODS)", ""))
+            best = self._best_match(candidates, source_attr=source_attr)
             if best["score"] < self.threshold:
                 status = "unmatched"
             else:
