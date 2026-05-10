@@ -1,13 +1,14 @@
 from __future__ import annotations
+
 import pandas as pd
-import trino
+from sqlalchemy import create_engine, text
 from config import TRINO_CONFIG_CSV
 
 
 class TrinoClient:
     def __init__(self):
         self._cfg = self._load_config()
-        self._conn = None
+        self._engine = None
 
     # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -20,6 +21,8 @@ class TrinoClient:
             "schema": "default",
             "auth_type": "none",
             "password": "",
+            "http_scheme": "http",
+            "verify": "true",
         }
         if not TRINO_CONFIG_CSV.exists():
             return defaults
@@ -35,30 +38,49 @@ class TrinoClient:
 
     def reload_config(self):
         self._cfg = self._load_config()
-        self._conn = None
+        self._engine = None
 
     def get_config(self) -> dict:
         return self._cfg.copy()
 
-    # ── Connection ─────────────────────────────────────────────────────────────
+    # ── Engine ─────────────────────────────────────────────────────────────────
 
-    def _get_conn(self):
-        if self._conn is None:
-            auth = None
-            if str(self._cfg.get("auth_type", "")).lower() == "basic":
-                auth = trino.auth.BasicAuthentication(
-                    str(self._cfg.get("user", "")),
-                    str(self._cfg.get("password", "")),
-                )
-            self._conn = trino.dbapi.connect(
-                host=str(self._cfg["host"]),
-                port=int(self._cfg.get("port", 8080)),
-                user=str(self._cfg["user"]),
-                catalog=str(self._cfg.get("catalog", "hive")),
-                schema=str(self._cfg.get("schema", "default")),
-                auth=auth,
-            )
-        return self._conn
+    def _get_engine(self):
+        """Build a SQLAlchemy engine using the trino:// dialect."""
+        if self._engine is None:
+            cfg = self._cfg
+            user = str(cfg.get("user", "analyst"))
+            password = str(cfg.get("password", ""))
+            host = str(cfg.get("host", "localhost"))
+            port = int(cfg.get("port", 8080))
+            catalog = str(cfg.get("catalog", "hive"))
+            schema = str(cfg.get("schema", "default"))
+            http_scheme = str(cfg.get("http_scheme", "http"))
+            verify = str(cfg.get("verify", "true"))
+
+            # trino://user[:password]@host:port/catalog/schema
+            if password and str(cfg.get("auth_type", "none")).lower() == "basic":
+                userinfo = f"{user}:{password}"
+            else:
+                userinfo = user
+
+            url = f"trino://{userinfo}@{host}:{port}/{catalog}/{schema}"
+
+            connect_args: dict = {
+                "http_scheme": http_scheme,
+            }
+
+            # verify: "true" / "false" / path-to-cert
+            v_lower = verify.lower()
+            if v_lower == "true":
+                connect_args["verify"] = True
+            elif v_lower == "false":
+                connect_args["verify"] = False
+            else:
+                connect_args["verify"] = verify  # path to CA bundle
+
+            self._engine = create_engine(url, connect_args=connect_args)
+        return self._engine
 
     # ── Query ──────────────────────────────────────────────────────────────────
 
@@ -66,11 +88,11 @@ class TrinoClient:
         sql_clean = sql.strip().rstrip(";")
         if "limit" not in sql_clean.lower():
             sql_clean = f"{sql_clean} LIMIT {limit}"
-        conn = self._get_conn()
-        cur = conn.cursor()
-        cur.execute(sql_clean)
-        cols = [d[0] for d in cur.description]
-        rows = cur.fetchall()
+        engine = self._get_engine()
+        with engine.connect() as conn:
+            result = conn.execute(text(sql_clean))
+            cols = list(result.keys())
+            rows = result.fetchall()
         return pd.DataFrame(rows, columns=cols)
 
     def test_connection(self) -> tuple[bool, str]:

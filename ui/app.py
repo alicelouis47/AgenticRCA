@@ -642,6 +642,20 @@ def page_trino():
             auth_type = st.selectbox("Auth Type", ["none", "basic"], index=0 if cfg.get("auth_type", "none") == "none" else 1)
             password = st.text_input("Password (if basic auth)", type="password", value=str(cfg.get("password", "")))
 
+            st.divider()
+            _scheme_idx = 0 if cfg.get("http_scheme", "http") == "http" else 1
+            http_scheme = st.selectbox(
+                "HTTP Scheme",
+                ["http", "https"],
+                index=_scheme_idx,
+                help="Use 'https' when Trino is behind TLS/SSL.",
+            )
+            verify = st.text_input(
+                "SSL Verify",
+                value=str(cfg.get("verify", "true")),
+                help="'true' to verify using system CA, 'false' to skip, or absolute path to a CA bundle file.",
+            )
+
             if st.form_submit_button("💾 Save Config", type="primary"):
                 import csv
                 CONFIG_DIR.mkdir(exist_ok=True)
@@ -652,6 +666,7 @@ def page_trino():
                         ("host", host), ("port", port), ("user", user),
                         ("catalog", catalog), ("schema", schema),
                         ("auth_type", auth_type), ("password", password),
+                        ("http_scheme", http_scheme), ("verify", verify),
                     ]:
                         writer.writerow([k, v])
                 # Reload agent's Trino client
@@ -688,7 +703,18 @@ def page_trino():
 
         # CSV template download
         st.subheader("📥 CSV Template")
-        template = "parameter,value\nhost,localhost\nport,8080\nuser,analyst\ncatalog,hive\nschema,default\nauth_type,none\npassword,\n"
+        template = (
+            "parameter,value\n"
+            "host,localhost\n"
+            "port,8080\n"
+            "user,analyst\n"
+            "catalog,hive\n"
+            "schema,default\n"
+            "auth_type,none\n"
+            "password,\n"
+            "http_scheme,http\n"
+            "verify,true\n"
+        )
         st.download_button(
             "Download template CSV",
             data=template,
